@@ -44,10 +44,11 @@ Auto-fixes markdown formatting issues.
 ### 3. Format and lint frontend code (Biome)
 
 ```bash
-cd frontend/app && npx biome check --write .
+cd frontend && npx biome check --write .
 ```
 
-Auto-fixes formatting and lint issues in TypeScript/TSX files. If Biome reports errors that cannot be auto-fixed, report them to the user.
+Auto-fixes formatting and lint issues across the whole pnpm workspace — `app` and
+`packages/*` alike. Run it from `frontend/`, not `frontend/app`, or the packages go unchecked. If Biome reports errors that cannot be auto-fixed, report them to the user.
 
 ## Phase 2 — Fast checks (parallel)
 
