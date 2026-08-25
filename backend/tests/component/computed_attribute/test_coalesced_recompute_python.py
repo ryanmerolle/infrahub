@@ -16,6 +16,7 @@ import pytest
 
 from infrahub import config
 from infrahub.core.constants import ComputedAttributeKind, InfrahubKind
+from infrahub.core.initialization import create_branch
 from infrahub.core.manager import NodeManager
 from infrahub.core.merge.python_target_sources import build_python_target_deriver
 from infrahub.core.merge.recompute_coalescing import (
@@ -53,6 +54,11 @@ CAR_KIND = "TestCar"
 PERSON_KIND = "TestPerson"
 NAME_ATTRIBUTE = "computed_desc_python"
 OWNER_ATTRIBUTE = "computed_desc_python_owner"
+LABEL_ATTRIBUTE = "computed_desc_python_label"
+
+# Enough cars that a submission count following the node count is visible as a failure, and few
+# enough to stay inside one submission chunk.
+CAR_COUNT = 6
 
 # Stands for a target the pass could not narrow, so every node of the kind is refreshed.
 WHOLE_KIND = "whole-kind"
@@ -61,9 +67,13 @@ WHOLE_KIND = "whole-kind"
 # change on a field neither query reads selects nothing.
 QUERY_OWNER = "query { TestCar { edges { node { name { value } owner { node { name { value } } } } } } }"
 
+# The display label of a car is built from its own name, so the imprecision this read carries can
+# be held against TestCar alone instead of collapsing the whole read set.
+QUERY_LABEL = "query { TestCar { edges { node { display_label } } } }"
 
-def _schema_with_an_owner_reading_transform() -> SchemaRoot:
-    """The car/person Python schema, with the second attribute fed by the owner-reading transform.
+
+def _schema_with_a_second_transform(*, attribute_name: str, transform_name: str) -> SchemaRoot:
+    """The car/person Python schema, with the second attribute fed by the named transform.
 
     The owner relationship is optional here so that a test can delete a person while its cars
     survive, which is the shape a merged peer deletion takes.
@@ -72,56 +82,72 @@ def _schema_with_an_owner_reading_transform() -> SchemaRoot:
     car = next(node for node in schema.nodes if node.kind == CAR_KIND)
     car.get_relationship(name="owner").optional = True
     attribute = car.get_attribute(name="computed_desc_python_opaque")
-    attribute.name = OWNER_ATTRIBUTE
+    attribute.name = attribute_name
     attribute.computed_attribute = ComputedAttribute(
-        kind=ComputedAttributeKind.TRANSFORM_PYTHON, transform="transform_owner"
+        kind=ComputedAttributeKind.TRANSFORM_PYTHON, transform=transform_name
     )
     return schema
 
 
 @dataclass
 class PythonRecomputeDataset:
-    """Two cars owned by one person, both subscribed to the owner-reading transform's query."""
+    """Cars owned by one person, all subscribed to the second transform's query."""
 
     car_ids: list[str]
     person_id: str
 
 
-async def _seed(db: InfrahubDatabase, branch: Branch) -> PythonRecomputeDataset:
+async def _seed(
+    db: InfrahubDatabase,
+    branch: Branch,
+    *,
+    attribute_name: str = OWNER_ATTRIBUTE,
+    transform_name: str = "transform_owner",
+    query: str = QUERY_OWNER,
+    query_models: list[str] | None = None,
+) -> PythonRecomputeDataset:
     repo = await create_transform01(db=db, branch_name=branch.name)
 
-    query_owner = await Node.init(db=db, schema=InfrahubKind.GRAPHQLQUERY)
-    await query_owner.new(db=db, name="query_owner", query=QUERY_OWNER, models=[CAR_KIND, PERSON_KIND])
-    await query_owner.save(db=db)
+    second_query = await Node.init(db=db, schema=InfrahubKind.GRAPHQLQUERY)
+    await second_query.new(
+        db=db, name=f"query_{transform_name}", query=query, models=query_models or [CAR_KIND, PERSON_KIND]
+    )
+    await second_query.save(db=db)
 
-    transform_owner = await Node.init(db=db, schema=InfrahubKind.TRANSFORMPYTHON)
-    await transform_owner.new(
+    second_transform = await Node.init(db=db, schema=InfrahubKind.TRANSFORMPYTHON)
+    await second_transform.new(
         db=db,
-        name="transform_owner",
+        name=transform_name,
         file_path="transform.py",
         class_name="Transform",
-        query=query_owner,
+        query=second_query,
         repository=repo,
     )
-    await transform_owner.save(db=db)
+    await second_transform.save(db=db)
 
-    await load_schema(db=db, schema=_schema_with_an_owner_reading_transform(), update_db=True)
+    await load_schema(
+        db=db,
+        schema=_schema_with_a_second_transform(attribute_name=attribute_name, transform_name=transform_name),
+        update_db=True,
+    )
 
     person = await Node.init(db=db, schema=PERSON_KIND)
     await person.new(db=db, name="owner01")
     await person.save(db=db)
 
     cars: list[Node] = []
-    for index in range(2):
+    for index in range(CAR_COUNT):
         car = await Node.init(db=db, schema=CAR_KIND)
         await car.new(db=db, name=f"car{index}", owner=person)
         await car.save(db=db)
         cars.append(car)
 
     # One group per query, holding every node the query returned as a member and every node that
-    # computed through it as a subscriber: what a recompute of both cars leaves behind.
+    # computed through it as a subscriber: what a recompute of every car leaves behind.
     group = await Node.init(db=db, schema=InfrahubKind.GRAPHQLQUERYGROUP)
-    await group.new(db=db, name="query_owner", query=query_owner, members=[*cars, person], subscribers=cars)
+    await group.new(
+        db=db, name=f"query_{transform_name}", query=second_query, members=[*cars, person], subscribers=cars
+    )
     await group.save(db=db)
 
     return PythonRecomputeDataset(car_ids=[car.id for car in cars], person_id=person.id)
@@ -144,22 +170,25 @@ class CoalescedPythonTestBase(ScopedRecomputeTestBase):
         *,
         db: InfrahubDatabase,
         recorder: WorkflowRecorder,
-        default_branch: Branch,
+        branch: Branch,
         admin_account: CoreAccount,
         changes: Iterable[MergeChange],
     ) -> dict[str, list[str] | str]:
+        """Run the pass on ``branch`` and report one entry per attribute it submitted.
+
+        A merge recomputes on the destination branch, a rebase on the user branch, so the branch
+        the pass runs on is what the two shapes differ by.
+        """
         coordinator = MergeRecomputeCoordinator(
-            builder=CoalescedRecomputeBuilder(
-                schema_branch=registry.schema.get_schema_branch(name=default_branch.name)
-            ),
+            builder=CoalescedRecomputeBuilder(schema_branch=registry.schema.get_schema_branch(name=branch.name)),
             submitter=CoalescedRecomputeSubmitter(workflow=recorder),
             python_deriver=await build_python_target_deriver(db=db),
         )
 
         await coordinator.run(
             changes=changes,
-            branch=default_branch.name,
-            context=self._context(admin_account, default_branch),
+            branch=branch.name,
+            context=self._context(admin_account, branch),
         )
 
         submissions: dict[str, list[str] | str] = {}
@@ -168,6 +197,7 @@ class CoalescedPythonTestBase(ScopedRecomputeTestBase):
             assert attribute_name not in submissions, f"{attribute_name} was submitted more than once"
             assert call["parameters"]["coalesced"] is True
             assert call["parameters"]["node_kind"] == CAR_KIND
+            assert call["parameters"]["branch_name"] == branch.name
             submissions[attribute_name] = sorted(call["parameters"]["object_ids"])
         # A widened target goes to the whole-kind fan-out instead, and must not read as a skip.
         for call in recorder.get_submit_calls_for(TRIGGER_UPDATE_PYTHON_COMPUTED_ATTRIBUTES):
@@ -197,19 +227,58 @@ class TestCoalescedRecomputePython(CoalescedPythonTestBase):
         default_branch: Branch,
         admin_account: CoreAccount,
     ) -> None:
-        """Two created cars are one submission per attribute, not one per node."""
+        """Every created car is one submission per attribute, not one per node.
+
+        This is the merge shape: a branch that built new nodes, replayed on the destination. The
+        per-node automations answered it with one flow per created node.
+        """
         submissions = await self._run_pass(
             db=db,
             recorder=workflow_recorder,
-            default_branch=default_branch,
+            branch=default_branch,
             admin_account=admin_account,
             changes=[MergeChange(node_id=car_id, kind=CAR_KIND, action="created") for car_id in dataset.car_ids],
         )
 
+        # Two attributes over CAR_COUNT nodes: two flows, and the count follows the attributes.
+        assert len(dataset.car_ids) == CAR_COUNT
+        assert len(workflow_recorder.get_submit_calls_for(COMPUTED_ATTRIBUTE_PROCESS_TRANSFORM)) == 2
         assert submissions == {
             NAME_ATTRIBUTE: sorted(dataset.car_ids),
             OWNER_ATTRIBUTE: sorted(dataset.car_ids),
         }
+
+    async def test_a_rebase_submits_the_same_shape_on_the_user_branch(
+        self,
+        dataset: PythonRecomputeDataset,
+        db: InfrahubDatabase,
+        workflow_recorder: WorkflowRecorder,
+        default_branch: Branch,
+        admin_account: CoreAccount,
+    ) -> None:
+        """A rebase replays the destination's changes on the user branch, and recomputes there.
+
+        The submission count is the same as on merge: what grows the count is the number of
+        affected attributes, not the number of replayed nodes.
+        """
+        user_branch = await create_branch(branch_name="coalesced-python-rebase", db=db)
+
+        submissions = await self._run_pass(
+            db=db,
+            recorder=workflow_recorder,
+            branch=user_branch,
+            admin_account=admin_account,
+            changes=[
+                MergeChange(
+                    node_id=dataset.person_id,
+                    kind=PERSON_KIND,
+                    action="updated",
+                    changed_fields=frozenset({"name"}),
+                )
+            ],
+        )
+
+        assert submissions == {OWNER_ATTRIBUTE: sorted(dataset.car_ids)}
 
     async def test_a_change_to_an_unread_field_submits_nothing(
         self,
@@ -223,7 +292,7 @@ class TestCoalescedRecomputePython(CoalescedPythonTestBase):
         submissions = await self._run_pass(
             db=db,
             recorder=workflow_recorder,
-            default_branch=default_branch,
+            branch=default_branch,
             admin_account=admin_account,
             changes=[
                 MergeChange(
@@ -253,7 +322,7 @@ class TestCoalescedRecomputePython(CoalescedPythonTestBase):
         submissions = await self._run_pass(
             db=db,
             recorder=workflow_recorder,
-            default_branch=default_branch,
+            branch=default_branch,
             admin_account=admin_account,
             changes=[
                 MergeChange(
@@ -279,7 +348,7 @@ class TestCoalescedRecomputePython(CoalescedPythonTestBase):
         submissions = await self._run_pass(
             db=db,
             recorder=workflow_recorder,
-            default_branch=default_branch,
+            branch=default_branch,
             admin_account=admin_account,
             changes=[
                 MergeChange(
@@ -325,7 +394,7 @@ class TestCoalescedRecomputePythonDeletedPeer(CoalescedPythonTestBase):
         submissions = await self._run_pass(
             db=db,
             recorder=workflow_recorder,
-            default_branch=default_branch,
+            branch=default_branch,
             admin_account=admin_account,
             changes=[
                 MergeChange(node_id=deleted_peer_dataset.person_id, kind=PERSON_KIND, action="deleted"),
@@ -337,3 +406,89 @@ class TestCoalescedRecomputePythonDeletedPeer(CoalescedPythonTestBase):
         )
 
         assert submissions == {OWNER_ATTRIBUTE: sorted(deleted_peer_dataset.car_ids)}
+
+
+class TestCoalescedRecomputePythonImpreciseRead(CoalescedPythonTestBase):
+    """A query reading a derived field still narrows to the readers of the changed nodes.
+
+    The fields behind a display label cannot be named, so any change to the kind read through it
+    counts. What must not happen is a widening to the whole kind on every merge: a derived value
+    built from that kind's own attributes keeps every input under the kind the readers subscribe
+    through, which is exactly what the reverse lookup answers.
+    """
+
+    @pytest.fixture(scope="class")
+    async def label_dataset(
+        self,
+        db: InfrahubDatabase,
+        default_branch: Branch,
+        client: InfrahubClient,
+        admin_account: CoreAccount,
+    ) -> PythonRecomputeDataset:
+        return await _seed(
+            db=db,
+            branch=default_branch,
+            attribute_name=LABEL_ATTRIBUTE,
+            transform_name="transform_label",
+            query=QUERY_LABEL,
+            query_models=[CAR_KIND],
+        )
+
+    async def test_a_derived_read_narrows_to_its_readers_instead_of_the_whole_kind(
+        self,
+        label_dataset: PythonRecomputeDataset,
+        db: InfrahubDatabase,
+        workflow_recorder: WorkflowRecorder,
+        default_branch: Branch,
+        admin_account: CoreAccount,
+    ) -> None:
+        """The seat count feeds no display label, but nothing can prove that, so the readers count.
+
+        The other attribute reads the car name only, and the seat count is not it, so a widening
+        would show up here as both attributes going to the whole-kind fan-out.
+        """
+        submissions = await self._run_pass(
+            db=db,
+            recorder=workflow_recorder,
+            branch=default_branch,
+            admin_account=admin_account,
+            changes=[
+                MergeChange(
+                    node_id=label_dataset.car_ids[0],
+                    kind=CAR_KIND,
+                    action="updated",
+                    changed_fields=frozenset({"nbr_seats"}),
+                )
+            ],
+        )
+
+        assert submissions == {LABEL_ATTRIBUTE: sorted(label_dataset.car_ids)}
+
+    async def test_the_imprecision_does_not_spread_to_the_kinds_the_query_never_reads(
+        self,
+        label_dataset: PythonRecomputeDataset,
+        db: InfrahubDatabase,
+        workflow_recorder: WorkflowRecorder,
+        default_branch: Branch,
+        admin_account: CoreAccount,
+    ) -> None:
+        """Holding the imprecision against one kind is what keeps the other kinds filtered.
+
+        Neither query reads the person, so a merged rename of the owner selects nothing at all.
+        """
+        submissions = await self._run_pass(
+            db=db,
+            recorder=workflow_recorder,
+            branch=default_branch,
+            admin_account=admin_account,
+            changes=[
+                MergeChange(
+                    node_id=label_dataset.person_id,
+                    kind=PERSON_KIND,
+                    action="updated",
+                    changed_fields=frozenset({"name"}),
+                )
+            ],
+        )
+
+        assert submissions == {}
