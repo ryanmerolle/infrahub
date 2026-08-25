@@ -22,7 +22,10 @@ from infrahub.core.merge.recompute_coalescing import (
 from infrahub.core.recompute.bulk_write import WrittenNode
 from infrahub.core.schema.schema_branch import SchemaBranch
 from infrahub.events.models import EventBranchContext, EventContext
-from tests.adapters.python_target_sources import RecordingPythonTargetDeriver
+from tests.adapters.python_target_sources import (
+    FailingPythonTargetDeriver,
+    RecordingPythonTargetDeriver,
+)
 from tests.adapters.workflow import WorkflowRecorder
 from tests.helpers.merge_recompute.dataset import build_chain_schema, chain_kind
 
@@ -108,3 +111,40 @@ async def test_a_chained_level_derives_the_python_targets_of_its_writes() -> Non
     assert len(python_calls) == 1
     assert python_calls[0]["parameters"]["recompute_depth"] == 1
     assert python_calls[0]["parameters"]["coalesced"] is True
+
+
+async def test_a_failing_derivation_still_submits_the_schema_families() -> None:
+    """The four families are submitted together, so one derivation must not cancel the others.
+
+    Only the Python derivation reads the database. Letting its failure out would silently drop the
+    recompute of every family, which is what a closed session on the rebase path used to do.
+    """
+    deriver = FailingPythonTargetDeriver()
+    coordinator = MergeRecomputeCoordinator(
+        builder=CoalescedRecomputeBuilder(schema_branch=_schema_branch()),
+        submitter=CoalescedRecomputeSubmitter(workflow=WorkflowRecorder()),
+        python_deriver=deriver,
+    )
+
+    submissions = await coordinator.run(changes=[_root_change()], branch=BRANCH, context=_event_context())
+
+    assert deriver.calls == [BRANCH]
+    assert _families(submissions) == {COMPUTED_ATTRIBUTE}
+
+
+async def test_a_failing_derivation_on_a_chained_level_still_submits_the_schema_families() -> None:
+    deriver = FailingPythonTargetDeriver()
+
+    submissions = await RecomputeChainSubmitter(
+        builder=CoalescedRecomputeBuilder(schema_branch=_schema_branch()),
+        submitter=CoalescedRecomputeSubmitter(workflow=WorkflowRecorder()),
+        python_deriver=deriver,
+    ).submit(
+        written=[WrittenNode(node_id="l1-0", kind=chain_kind(1), fields=("name",))],
+        branch=BRANCH,
+        context=_event_context(),
+        depth=0,
+    )
+
+    assert deriver.calls == [BRANCH]
+    assert _families(submissions) == {COMPUTED_ATTRIBUTE}

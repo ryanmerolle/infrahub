@@ -156,6 +156,25 @@ class PythonTargetDeriver(Protocol):
     ) -> list[AffectedTarget]: ...
 
 
+async def _resolve_python_targets(
+    deriver: PythonTargetDeriver,
+    *,
+    changes: Iterable[MergeChange],
+    branch: str,
+    schema_changed_elements: ChangedElementSet | None,
+) -> list[AffectedTarget]:
+    """The affected Python targets, or none of them when the derivation itself fails.
+
+    The four families are submitted together, and this is the only derivation that reads the
+    database, so letting its failure out would drop the three that cannot fail with it.
+    """
+    try:
+        return await deriver.resolve(changes=changes, branch=branch, schema_changed_elements=schema_changed_elements)
+    except Exception:
+        log.exception("Skipping the Python transform recompute on branch %s: the derivation failed", branch)
+        return []
+
+
 class DisabledPythonTargetDeriver:
     """The derivation while the coalescing switch is off: the per-node automations own the work."""
 
@@ -579,8 +598,8 @@ class MergeRecomputeCoordinator:
     ) -> list[CoalescedSubmission]:
         change_list = list(changes)
         coalesced = self.builder.build(changes=change_list, branch=branch)
-        python_targets = await self.python_deriver.resolve(
-            changes=change_list, branch=branch, schema_changed_elements=schema_changed_elements
+        python_targets = await _resolve_python_targets(
+            self.python_deriver, changes=change_list, branch=branch, schema_changed_elements=schema_changed_elements
         )
         return await self.submitter.submit(coalesced=coalesced.with_targets(python_targets), context=context)
 
@@ -646,7 +665,9 @@ class RecomputeChainSubmitter:
             for node in written
         ]
         coalesced = self.builder.build(changes=changes, branch=branch)
-        python_targets = await self.python_deriver.resolve(changes=changes, branch=branch, schema_changed_elements=None)
+        python_targets = await _resolve_python_targets(
+            self.python_deriver, changes=changes, branch=branch, schema_changed_elements=None
+        )
         return await self.submitter.submit(
             coalesced=coalesced.with_targets(python_targets), context=context, recompute_depth=next_depth
         )

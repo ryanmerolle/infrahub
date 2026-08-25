@@ -81,3 +81,20 @@ class FailingSubscriberSource:
     async def subscribers(self, *, node_ids: list[str], branch: str) -> list[SubscriberRef]:
         self.calls.append(tuple(node_ids))
         raise RuntimeError("subscriber lookup rejected")
+
+
+class FailingPythonTargetDeriver:
+    """Raises on every derivation, to prove the other families are submitted regardless."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def resolve(
+        self,
+        *,
+        changes: Iterable[MergeChange],
+        branch: str,
+        schema_changed_elements: ChangedElementSet | None,
+    ) -> list[AffectedTarget]:
+        self.calls.append(branch)
+        raise RuntimeError("read set unavailable")

@@ -344,12 +344,15 @@ async def rebase_branch(branch: str, context: InfrahubContext, send_events: bool
             user_branch.name if user_branch.name in registry.get_altered_schema_branches() else registry.default_branch
         )
         schema_branch = registry.schema.get_schema_branch(name=schema_name)
-        coordinator = MergeRecomputeCoordinator(
-            builder=CoalescedRecomputeBuilder(schema_branch=schema_branch),
-            submitter=CoalescedRecomputeSubmitter(workflow=get_workflow()),
-            python_deriver=await build_python_target_deriver(db=db),
-        )
-        await coordinator.run(changes=changes, branch=user_branch.name, context=event_context)
+        # The session the rebase ran under is closed by this point, and the Python derivation reads
+        # the database.
+        async with database.start_session() as recompute_db:
+            coordinator = MergeRecomputeCoordinator(
+                builder=CoalescedRecomputeBuilder(schema_branch=schema_branch),
+                submitter=CoalescedRecomputeSubmitter(workflow=get_workflow()),
+                python_deriver=await build_python_target_deriver(db=recompute_db),
+            )
+            await coordinator.run(changes=changes, branch=user_branch.name, context=event_context)
 
 
 @flow(name="branch-merge", flow_run_name="Merge branch {branch} into main")
