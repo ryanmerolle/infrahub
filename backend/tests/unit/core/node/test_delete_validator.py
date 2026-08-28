@@ -84,3 +84,46 @@ def test_repository_cascade_reaches_exactly_expected_kinds(case: RepositoryCase)
         InfrahubKind.USERVALIDATOR,
     }
     assert reachable == expected_cascade
+
+
+def _index_for(kind: str) -> NodeDeleteIndex:
+    schema_branch = SchemaBranch(cache={}, name="test")
+    schema_branch.load_schema(schema=SchemaRoot(**core_models))
+    schema_branch.process()
+    all_schemas = schema_branch.get_all(duplicate=False)
+
+    index = NodeDeleteIndex(all_schemas_map=all_schemas)
+    schema = all_schemas[kind]
+    assert isinstance(schema, NodeSchema)
+    index.index(start_schemas=[schema])
+    return index
+
+
+def test_account_cascade_reaches_its_internal_children() -> None:
+    index = _index_for(InfrahubKind.ACCOUNT)
+
+    assert _cascade_closure(index, InfrahubKind.ACCOUNT) == {
+        InfrahubKind.EXTERNALIDENTITY,
+        InfrahubKind.ACCOUNTTOKEN,
+    }
+
+
+def test_internal_cascade_peers_are_resolved_separately() -> None:
+    """The cascade lookup for an internal peer is a separate query, so the index has to name it.
+
+    The identifiers are asserted in full: the account side of `tokens` has to be paired with the
+    token's own `account__token`, or the cascade resolves an identifier no edge in the graph uses.
+    """
+    account_index = _index_for(InfrahubKind.ACCOUNT)
+
+    assert {
+        (full_id.source_kind, full_id.identifier, full_id.destination_kind)
+        for full_id in account_index.get_internal_cascade_relationship_identifiers()
+    } == {
+        (InfrahubKind.ACCOUNT, "account__external_identity", InfrahubKind.EXTERNALIDENTITY),
+        (InfrahubKind.ACCOUNT, "account__token", InfrahubKind.ACCOUNTTOKEN),
+    }
+
+    # A cascade to a peer outside the Internal namespace stays on the general lookup.
+    repository_index = _index_for(InfrahubKind.REPOSITORY)
+    assert repository_index.get_internal_cascade_relationship_identifiers() == []
