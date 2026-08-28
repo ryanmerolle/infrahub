@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from infrahub import config
 from infrahub.computed_attribute.gather import gather_python_transform_attributes
@@ -27,6 +27,74 @@ if TYPE_CHECKING:
     from infrahub.services import InfrahubComponent
 
 
+class DeclaredPythonAttributes(Protocol):
+    """The Python transform computed attributes a branch's schema declares, as ``(kind, name)``."""
+
+    async def declared(self, *, branch: str) -> list[tuple[str, str]]: ...
+
+
+class AnalyzedPythonReadSets(Protocol):
+    """The read set of every attribute whose transform query could be resolved and analyzed.
+
+    Raises whatever the resolution raises, so the caller decides what a failure costs.
+    """
+
+    async def analyzed(self, *, branch: str) -> dict[tuple[str, str], TransformReadSet]: ...
+
+
+class SchemaDeclaredPythonAttributes:
+    """The declared attributes, read from the branch's schema once its workers agree on it."""
+
+    def __init__(self, db: InfrahubDatabase, component: InfrahubComponent) -> None:
+        self.db = db
+        self.component = component
+
+    async def declared(self, *, branch: str) -> list[tuple[str, str]]:
+        # A worker behind on the schema declares no Python attribute, which reads as nothing to do.
+        await wait_for_schema_to_converge(
+            branch_name=branch, component=self.component, db=self.db, log=get_run_logger()
+        )
+        schema_branch = registry.schema.get_schema_branch(name=branch)
+        return [
+            (kind, attribute.name)
+            for kind, attributes in schema_branch.computed_attributes.get_python_attributes_per_node().items()
+            for attribute in attributes
+        ]
+
+
+class GatheredPythonReadSets:
+    """The read sets, mapped from the transform queries the gather resolved and analyzed.
+
+    A query whose root is not pinned to a single object gets no read set. Readers are resolved
+    through query-group membership, which records what the last run read and never what the next one
+    would: when any number of objects can answer the query, a node can enter or leave the result set
+    while nothing changes on the nodes already in it, so a created node is invisible to the existing
+    subscribers and a deleted one leaves no membership behind.
+
+    The schema-change backfill maps the same queries without this restriction. It asks which
+    attributes a changed schema element feeds and then refreshes whole kinds, so it never resolves
+    readers and cannot miss one.
+    """
+
+    def __init__(self, db: InfrahubDatabase) -> None:
+        self.db = db
+
+    async def analyzed(self, *, branch: str) -> dict[tuple[str, str], TransformReadSet]:
+        schema_branch = registry.schema.get_schema_branch(name=branch)
+        gathered = await gather_python_transform_attributes(db=self.db, branch_name=branch)
+
+        read_sets: dict[tuple[str, str], TransformReadSet] = {}
+        for item in gathered:
+            report = item.query_analyzer.query_report
+            key = (item.computed_attribute.kind, item.computed_attribute.attribute.name)
+            if not report.only_has_unique_targets:
+                log.info("Widening the recompute of %s.%s: its transform query is not pinned to one object", *key)
+                read_sets[key] = TransformReadSet.imprecise()
+                continue
+            read_sets[key] = transform_read_set_from_query_report(report=report, schema_branch=schema_branch)
+        return read_sets
+
+
 class DatabasePythonReadSetSource:
     """Read sets for every Python transform computed attribute declared on a branch.
 
@@ -37,42 +105,28 @@ class DatabasePythonReadSetSource:
     strictly, and one missing peer would otherwise take the whole pass down with it.
     """
 
-    def __init__(self, db: InfrahubDatabase, component: InfrahubComponent) -> None:
-        self.db = db
-        self.component = component
+    def __init__(self, declared_attributes: DeclaredPythonAttributes, read_sets: AnalyzedPythonReadSets) -> None:
+        self.declared_attributes = declared_attributes
+        self.read_sets_source = read_sets
 
     async def read_sets(self, *, branch: str) -> list[PythonAttributeReadSet]:
-        # A worker behind on the schema declares no Python attribute, which reads as nothing to do.
-        await wait_for_schema_to_converge(
-            branch_name=branch, component=self.component, db=self.db, log=get_run_logger()
-        )
-        schema_branch = registry.schema.get_schema_branch(name=branch)
-        attributes_per_kind = schema_branch.computed_attributes.get_python_attributes_per_node()
-        if not attributes_per_kind:
+        declared = await self.declared_attributes.declared(branch=branch)
+        if not declared:
             return []
 
         try:
-            gathered = await gather_python_transform_attributes(db=self.db, branch_name=branch)
+            analyzed = await self.read_sets_source.analyzed(branch=branch)
         except Exception:
             log.exception("Widening every Python computed attribute on %s: the read-set gather failed", branch)
-            gathered = []
-        analyzed = {
-            (
-                item.computed_attribute.kind,
-                item.computed_attribute.attribute.name,
-            ): transform_read_set_from_query_report(
-                report=item.query_analyzer.query_report, schema_branch=schema_branch
-            )
-            for item in gathered
-        }
+            analyzed = {}
+
         return [
             PythonAttributeReadSet(
                 kind=kind,
-                attribute_name=attribute.name,
-                read_set=analyzed.get((kind, attribute.name), TransformReadSet.imprecise()),
+                attribute_name=attribute_name,
+                read_set=analyzed.get((kind, attribute_name), TransformReadSet.imprecise()),
             )
-            for kind, attributes in attributes_per_kind.items()
-            for attribute in attributes
+            for kind, attribute_name in declared
         ]
 
 
@@ -96,6 +150,9 @@ async def build_python_target_deriver(*, db: InfrahubDatabase) -> PythonTargetDe
         return DisabledPythonTargetDeriver()
 
     return PythonTargetResolver(
-        read_set_source=DatabasePythonReadSetSource(db=db, component=await get_component()),
+        read_set_source=DatabasePythonReadSetSource(
+            declared_attributes=SchemaDeclaredPythonAttributes(db=db, component=await get_component()),
+            read_sets=GatheredPythonReadSets(db=db),
+        ),
         subscriber_source=ClientSubscriberSource(client=get_client()),
     )

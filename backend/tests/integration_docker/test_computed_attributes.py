@@ -43,9 +43,7 @@ REBASE_DEVICE_INSTANCES = (21, 22, 23, 24)
 
 # The stack under test carries the coalesced pass unless the compose variable turns it off, which
 # is how the same value assertions run against both dispatch modes.
-COALESCED_PYTHON_RECOMPUTE = (
-    os.environ.get("INFRAHUB_COALESCE_PYTHON_RECOMPUTE_AFTER_MERGE", "true").lower() != "false"
-)
+COALESCED_PYTHON_RECOMPUTE = os.environ.get("INFRAHUB_COALESCE_PYTHON_RECOMPUTE_AFTER_MERGE", "true").lower() != "false"
 
 
 async def wait_for_all_tasks_to_be_completed(client: InfrahubClient) -> None:

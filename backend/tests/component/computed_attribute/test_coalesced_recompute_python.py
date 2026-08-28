@@ -65,11 +65,17 @@ WHOLE_KIND = "whole-kind"
 
 # The owner is read across the relationship, so a change on the person selects the cars, while a
 # change on a field neither query reads selects nothing.
-QUERY_OWNER = "query { TestCar { edges { node { name { value } owner { node { name { value } } } } } } }"
+QUERY_OWNER = (
+    "query TestCarOwner($id: ID!) "
+    "{ TestCar(ids: [$id]) { edges { node { name { value } owner { node { name { value } } } } } } }"
+)
 
 # The display label of a car is built from its own name, so the imprecision this read carries can
 # be held against TestCar alone instead of collapsing the whole read set.
-QUERY_LABEL = "query { TestCar { edges { node { display_label } } } }"
+QUERY_LABEL = "query TestCarLabel($id: ID!) { TestCar(ids: [$id]) { edges { node { display_label } } } }"
+
+# No root filter, so any number of cars can answer it.
+QUERY_UNPINNED = "query TestCarAll { TestCar { edges { node { name { value } } } } }"
 
 
 def _schema_with_a_second_transform(*, attribute_name: str, transform_name: str) -> SchemaRoot:
@@ -492,3 +498,58 @@ class TestCoalescedRecomputePythonImpreciseRead(CoalescedPythonTestBase):
         )
 
         assert submissions == {}
+
+
+class TestCoalescedRecomputePythonUnpinnedQuery(CoalescedPythonTestBase):
+    """A transform query that is not pinned to one object widens to its whole kind.
+
+    Readers come from query-group membership, which records what the last run read and never what
+    the next one would. With an unpinned root a car can enter or leave the result set while nothing
+    changes on the cars already in it, so a created one is invisible to the existing subscribers and
+    a deleted one leaves no membership behind.
+    """
+
+    @pytest.fixture(scope="class")
+    async def unpinned_dataset(
+        self,
+        db: InfrahubDatabase,
+        default_branch: Branch,
+        client: InfrahubClient,
+        admin_account: CoreAccount,
+    ) -> PythonRecomputeDataset:
+        return await _seed(
+            db=db,
+            branch=default_branch,
+            transform_name="transform_unpinned",
+            query=QUERY_UNPINNED,
+            query_models=[CAR_KIND],
+        )
+
+    async def test_an_unpinned_query_widens_while_its_pinned_sibling_narrows(
+        self,
+        unpinned_dataset: PythonRecomputeDataset,
+        db: InfrahubDatabase,
+        workflow_recorder: WorkflowRecorder,
+        default_branch: Branch,
+        admin_account: CoreAccount,
+    ) -> None:
+        """The guard is per attribute: the sibling reading the same field still resolves its nodes."""
+        submissions = await self._run_pass(
+            db=db,
+            recorder=workflow_recorder,
+            branch=default_branch,
+            admin_account=admin_account,
+            changes=[
+                MergeChange(
+                    node_id=unpinned_dataset.car_ids[0],
+                    kind=CAR_KIND,
+                    action="updated",
+                    changed_fields=frozenset({"name"}),
+                )
+            ],
+        )
+
+        assert submissions == {
+            NAME_ATTRIBUTE: sorted(unpinned_dataset.car_ids),
+            OWNER_ATTRIBUTE: WHOLE_KIND,
+        }
