@@ -1,0 +1,8 @@
+[global]
+disable = ["MD013", "MD060", "MD029", "MD033"]
+
+[MD024]
+siblings-only = true
+
+[MD025]
+front-matter-title = ""
